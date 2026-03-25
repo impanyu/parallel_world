@@ -420,6 +420,12 @@ class SqliteDB {
     if (!cols.includes('locale')) {
       this.db.exec("ALTER TABLE users ADD COLUMN locale TEXT DEFAULT ''");
     }
+    if (!cols.includes('lastLoginAt')) {
+      this.db.exec("ALTER TABLE users ADD COLUMN lastLoginAt TEXT");
+    }
+    if (!cols.includes('lastActiveAt')) {
+      this.db.exec("ALTER TABLE users ADD COLUMN lastActiveAt TEXT");
+    }
   }
 
   _isEmpty() {
@@ -830,12 +836,23 @@ class SqliteDB {
     this.db.prepare(`INSERT INTO authSessions (id, token, userId, createdAt, expiresAt) VALUES (?, ?, ?, ?, ?)`).run(
       session.id, session.token, session.userId, session.createdAt, session.expiresAt
     );
+    this.db.prepare('UPDATE users SET lastLoginAt = ? WHERE id = ?').run(session.createdAt, userId);
     // Prune old sessions
     const count = this.db.prepare('SELECT COUNT(*) as cnt FROM authSessions').get().cnt;
     if (count > 5000) {
       this.db.prepare('DELETE FROM authSessions WHERE id IN (SELECT id FROM authSessions ORDER BY createdAt ASC LIMIT ?)').run(count - 5000);
     }
     return session;
+  }
+
+  touchUserActivity(userId) {
+    const user = this.getUser(userId);
+    if (!user) return;
+    const now = Date.now();
+    const last = user.lastActiveAt ? new Date(user.lastActiveAt).getTime() : 0;
+    if (now - last > 60 * 60 * 1000) {
+      this.db.prepare('UPDATE users SET lastActiveAt = ? WHERE id = ?').run(new Date(now).toISOString(), userId);
+    }
   }
 
   getUserBySessionToken(token) {
@@ -1105,6 +1122,15 @@ class SqliteDB {
       }
       return false;
     });
+  }
+
+  getRecentOriginalPosts(limit = 30) {
+    return this.db.prepare(
+      `SELECT * FROM contents
+       WHERE (parentId IS NULL OR parentId = '')
+         AND (repostOfId IS NULL OR repostOfId = '')
+       ORDER BY createdAt DESC LIMIT ?`
+    ).all(limit).map(hydrateContent);
   }
 
   getChildren(contentId) {

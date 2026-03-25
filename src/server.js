@@ -750,7 +750,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && pathname === '/api/admin/users') {
       if (!verifyAdmin(req)) { sendJson(res, 401, { error: 'Not authenticated.' }); return; }
       const users = db.db.prepare(`
-        SELECT id, name, email, userType, credits, createdAt,
+        SELECT id, name, email, userType, credits, createdAt, lastActiveAt,
           (SELECT COUNT(*) FROM agents WHERE ownerUserId = users.id) as agentCount
         FROM users ORDER BY createdAt DESC
       `).all();
@@ -768,6 +768,59 @@ const server = http.createServer(async (req, res) => {
         ORDER BY a.createdAt DESC
       `).all();
       sendJson(res, 200, { agents });
+      return;
+    }
+
+    if (req.method === 'GET' && pathname === '/api/admin/running-agents') {
+      if (!verifyAdmin(req)) { sendJson(res, 401, { error: 'Not authenticated.' }); return; }
+      const { getRunProgress: getProgress } = await import('./agentRuntime.js');
+      const allAgents = db.getAllAgents();
+      const running = [];
+      for (const a of allAgents) {
+        const prog = getProgress(a.id);
+        if (prog) {
+          const owner = db.getUser(a.ownerUserId);
+          running.push({
+            id: a.id, name: a.name, ownerName: owner?.name || a.ownerUserId,
+            phase: prog.phase || '—', step: prog.step || 0, maxSteps: prog.maxSteps || 0,
+            startedAt: prog.startedAt || null
+          });
+        }
+      }
+      sendJson(res, 200, { agents: running });
+      return;
+    }
+
+    if (req.method === 'GET' && pathname === '/api/admin/active-users') {
+      if (!verifyAdmin(req)) { sendJson(res, 401, { error: 'Not authenticated.' }); return; }
+      const period = url.searchParams.get('period') || 'day'; // day, week, month
+      const page = Math.max(1, parseInt(url.searchParams.get('page') || '1'));
+      const perPage = 50;
+
+      const now = new Date();
+      let since;
+      if (period === 'week') since = new Date(now.getTime() - 7 * 86400000).toISOString();
+      else if (period === 'month') since = new Date(now.getFullYear(), now.getMonth(), 1).toISOString();
+      else since = new Date(now.getFullYear(), now.getMonth(), now.getDate()).toISOString();
+
+      const rows = db.db.prepare(`
+        SELECT u.id, u.name, u.email, u.userType, u.credits,
+          (SELECT COUNT(*) FROM contents WHERE authorId = u.id AND createdAt >= ?) as postCount,
+          (SELECT COUNT(*) FROM reactions WHERE actorId = u.id AND createdAt >= ?) as reactionCount
+        FROM users u
+        WHERE u.id IN (
+          SELECT DISTINCT authorId FROM contents WHERE createdAt >= ?
+          UNION
+          SELECT DISTINCT actorId FROM reactions WHERE createdAt >= ?
+        )
+        ORDER BY postCount DESC
+      `).all(since, since, since, since);
+
+      const total = rows.length;
+      const totalPages = Math.ceil(total / perPage);
+      const users = rows.slice((page - 1) * perPage, page * perPage);
+
+      sendJson(res, 200, { users, total, page, totalPages });
       return;
     }
 
@@ -1169,6 +1222,7 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === 'GET' && pathname === '/api/auth/me') {
       if (!sessionUser) throw new Error('Not authenticated.');
+      db.touchUserActivity(sessionUser.id);
       sendJson(res, 200, { user: sessionUser });
       return;
     }
@@ -1371,6 +1425,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === 'GET' && pathname === '/api/agents') {
+      if (apiUser) db.touchUserActivity(apiUser.id);
       sendJson(res, 200, { agents: db.getAllAgents() });
       return;
     }
@@ -1782,7 +1837,22 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    if (req.method === 'GET' && pathname === '/api/world/feed') {
+      const limit = Math.min(200, Math.max(1, parseInt(url.searchParams.get('limit')) || 30));
+      function buildTree(contentId) {
+        const content = contentWithStats(db.getContent(contentId));
+        const children = db.getChildren(contentId).map(c => buildTree(c.id));
+        const reposts = db.getRepostsOf(contentId).map(r => buildTree(r.id));
+        return { ...content, children, reposts };
+      }
+      const roots = db.getRecentOriginalPosts(limit);
+      const trees = roots.map(r => buildTree(r.id));
+      sendJson(res, 200, { trees });
+      return;
+    }
+
     if (req.method === 'GET' && pathname === '/api/contents') {
+      if (apiUser) db.touchUserActivity(apiUser.id);
       const personalized = url.searchParams.get('personalized');
       const followerKind = url.searchParams.get('followerKind');
       const followerId = url.searchParams.get('followerId');
@@ -2243,7 +2313,13 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    if (req.method === 'GET' && (pathname === '/' || pathname === '/index.html')) {
+    if (req.method === 'GET' && pathname === '/') {
+      res.writeHead(302, { Location: '/world' });
+      res.end();
+      return;
+    }
+
+    if (req.method === 'GET' && pathname === '/index.html') {
       sendFile(res, path.join(publicDir, 'index.html'));
       return;
     }
@@ -2305,6 +2381,11 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === 'GET' && pathname === '/mentions') {
       sendFile(res, path.join(publicDir, 'mentions.html'));
+      return;
+    }
+
+    if (req.method === 'GET' && pathname === '/world') {
+      sendFile(res, path.join(publicDir, 'world.html'));
       return;
     }
 
